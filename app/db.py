@@ -170,6 +170,33 @@ def init_db(path: Path | None = None) -> None:
             BEGIN
                 SELECT RAISE(ABORT, 'event stream is immutable');
             END;
+
+            -- 可靠事件订阅：committed_sequence 为已确认游标（投递严格从
+            -- sequence > committed_sequence 开始，只有 ack 才推进，不漏不越）。
+            -- dag_id 非空时只投递该 DAG 的事件（与 GET /events 的过滤口径一致），
+            -- NULL 表示订阅全库事件流。订阅行持久化，重启后游标语义不变。
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id                 TEXT PRIMARY KEY,
+                dag_id             TEXT,            -- 可选过滤；NULL 表示全库订阅
+                committed_sequence INTEGER NOT NULL DEFAULT 0 CHECK (committed_sequence >= 0),
+                created_at         TEXT NOT NULL
+            );
+
+            -- 在途投递批次：每个订阅至多一行（subscription_id 即主键），
+            -- 强制「同一订阅同时只允许一个未确认批次」。行内存本次批次的随机
+            -- delivery_token、租约过期时刻、批次最后一条 sequence、事件条数与
+            -- 首次响应原文（租约内重复 poll 逐字节回放）。ack 成功即删行；
+            -- 租约过期后的下次 poll 删旧行并以新令牌重新投递（游标仍停在
+            -- committed_sequence，未确认事件会被原样重投，绝不跳过）。
+            CREATE TABLE IF NOT EXISTS subscription_deliveries (
+                subscription_id    TEXT PRIMARY KEY REFERENCES subscriptions(id),
+                delivery_token     TEXT NOT NULL,   -- 每次（重）投递新生成的随机令牌
+                lease_expires_at   TEXT NOT NULL,   -- 租约过期时刻；过期前重复 poll 回放本批
+                last_sequence      INTEGER NOT NULL,-- 本批最后一条事件的 sequence；ack 后游标推进到该值
+                event_count        INTEGER NOT NULL,
+                delivered_at       TEXT NOT NULL,
+                response_body      TEXT NOT NULL    -- 首次投递响应的原始 JSON 文本
+            );
             """
         )
 

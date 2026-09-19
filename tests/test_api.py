@@ -2382,3 +2382,288 @@ def test_cancel_works_on_legacy_sqlite_db(tmp_path, monkeypatch):
         service.cancel_task("t1")
     assert exc.value.status_code == 409
     assert len(service.list_events(0, 50, None)["events"]) == len(events)
+
+
+# ------------------------------------------------------------- 可靠事件订阅
+
+def _run_dag_full(client, dag_id, n_tasks=1):
+    """提交 DAG 并把所有任务跑完，制造 dag.created/task.claimed/task.succeeded 事件。"""
+    submit(client, [{"key": f"t{i}"} for i in range(n_tasks)], dag_id=dag_id)
+    while True:
+        claimed = client.post("/tasks/claim", json={"dag_id": dag_id, "limit": 10}).json()["claimed"]
+        if not claimed:
+            break
+        for t in claimed:
+            r = client.post(
+                f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": f"c-{t['task_id']}",
+                      "lease_token": t["lease_token"], "success": True},
+            )
+            assert r.status_code == 200
+
+
+def test_create_subscription_stores_cursor_and_filter(client):
+    _run_dag_full(client, "sub-d1")
+    r = client.post("/subscriptions", json={"dag_id": "sub-d1"})
+    assert r.status_code == 201
+    sub = r.json()
+    assert sub["dag_id"] == "sub-d1"
+    assert sub["committed_sequence"] == 0
+    assert sub["in_flight"] is None
+    assert sub["created_at"] and sub["id"]
+
+    # 显式起始游标
+    r = client.post("/subscriptions", json={"committed_sequence": 5})
+    assert r.status_code == 201
+    assert r.json()["committed_sequence"] == 5
+    assert r.json()["dag_id"] is None
+
+    # 非法 dag_id / 负数游标 -> 422
+    assert client.post("/subscriptions", json={"dag_id": ""}).status_code == 422
+    assert client.post("/subscriptions", json={"committed_sequence": -1}).status_code == 422
+
+
+def test_subscription_poll_returns_next_batch_in_sequence_order(client):
+    _run_dag_full(client, "sub-order-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+
+    r = client.post(f"/subscriptions/{sid}/poll", json={"limit": 2, "lease_seconds": 30})
+    assert r.status_code == 200
+    body = r.json()
+    assert [e["sequence"] for e in body["events"]] == [1, 2]
+    assert body["last_sequence"] == 2
+    assert body["committed_sequence"] == 0
+    token = body["delivery_token"]
+    assert token and body["lease_expires_at"]
+    # 事件对象与 GET /events 形态一致
+    assert set(body["events"][0]) == {
+        "sequence", "type", "dag_id", "task_id", "attempt",
+        "from_state", "to_state", "next_eligible_at", "occurred_at",
+    }
+
+    # 确认后下一批严格接续，不漏不重
+    assert client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": token}).status_code == 200
+    r = client.post(f"/subscriptions/{sid}/poll", json={"limit": 100, "lease_seconds": 30})
+    seqs = [e["sequence"] for e in r.json()["events"]]
+    assert seqs[0] == 3 and seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+    client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": r.json()["delivery_token"]})
+
+    # 追平后再 poll：空批次、无令牌、不占在途槽位
+    tail = client.post(f"/subscriptions/{sid}/poll", json={"limit": 10, "lease_seconds": 30}).json()
+    assert tail["events"] == [] and tail["delivery_token"] is None
+    assert tail["lease_expires_at"] is None
+    assert client.get(f"/subscriptions/{sid}").json()["in_flight"] is None
+
+
+def test_subscription_poll_replays_same_batch_byte_for_byte_while_leased(client):
+    _run_dag_full(client, "sub-replay-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+    r1 = client.post(f"/subscriptions/{sid}/poll", json={"limit": 2, "lease_seconds": 300})
+    first_text = r1.text
+    first = r1.json()
+
+    # 租约未过期：不同 limit/lease_seconds 也必须原样回放同一批次
+    r2 = client.post(f"/subscriptions/{sid}/poll", json={"limit": 99, "lease_seconds": 1})
+    assert r2.status_code == 200
+    assert r2.text == first_text  # 逐字节一致
+    r3 = client.post(f"/subscriptions/{sid}/poll", json={"limit": 1, "lease_seconds": 1})
+    assert r3.text == first_text
+    assert r3.json()["delivery_token"] == first["delivery_token"]
+
+
+def test_subscription_poll_redelivers_after_lease_expiry_with_new_token(client):
+    _run_dag_full(client, "sub-exp-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+    p1 = client.post(f"/subscriptions/{sid}/poll", json={"limit": 1, "lease_seconds": 0.2}).json()
+    first_seqs = [e["sequence"] for e in p1["events"]]
+    old_token = p1["delivery_token"]
+
+    time.sleep(0.1)
+    # 未过期仍是回放
+    assert client.post(f"/subscriptions/{sid}/poll", json={"limit": 50, "lease_seconds": 10}).text != ""
+    rep = client.post(f"/subscriptions/{sid}/poll", json={"limit": 50, "lease_seconds": 10})
+    assert rep.json()["delivery_token"] == old_token
+
+    time.sleep(0.25)
+    p2 = client.post(f"/subscriptions/{sid}/poll", json={"limit": 50, "lease_seconds": 30}).json()
+    assert p2["delivery_token"] != old_token
+    # 游标未推进：未确认事件从同一窗口重新投递
+    assert [e["sequence"] for e in p2["events"]][:1] == first_seqs
+
+    # 旧令牌确认 -> 409
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": old_token})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_delivery_token"
+    # 游标未被推进
+    assert client.get(f"/subscriptions/{sid}").json()["committed_sequence"] == 0
+    # 当前令牌可确认
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": p2["delivery_token"]})
+    assert r.status_code == 200
+    assert r.json()["committed_sequence"] == p2["events"][-1]["sequence"]
+
+
+def test_subscription_ack_rejects_wrong_missing_and_stale_tokens_without_advancing(client):
+    _run_dag_full(client, "sub-ack-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+
+    # 尚未 poll：无在途批次
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": "whatever"})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "no_pending_batch"
+
+    p = client.post(f"/subscriptions/{sid}/poll", json={"limit": 2, "lease_seconds": 30}).json()
+    # 错误令牌
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": "wrong-token"})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_delivery_token"
+    # 游标不动、批次仍在
+    detail = client.get(f"/subscriptions/{sid}").json()
+    assert detail["committed_sequence"] == 0
+    assert detail["in_flight"]["delivery_token"] == p["delivery_token"]
+
+    # 正确确认
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": p["delivery_token"]})
+    assert r.status_code == 200
+    assert r.json() == {
+        "subscription_id": sid,
+        "committed_sequence": p["last_sequence"],
+    }
+    # 重复确认（旧令牌）-> 409 no_pending_batch，游标不变
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": p["delivery_token"]})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "no_pending_batch"
+    assert client.get(f"/subscriptions/{sid}").json()["committed_sequence"] == p["last_sequence"]
+
+
+def test_subscription_cannot_skip_unacked_events(client):
+    _run_dag_full(client, "sub-skip-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+    # 取两批但只确认第二批是做不到的：未确认批次占着槽位，第二批根本发不出来
+    p1 = client.post(f"/subscriptions/{sid}/poll", json={"limit": 1, "lease_seconds": 300}).json()
+    replay = client.post(f"/subscriptions/{sid}/poll", json={"limit": 100, "lease_seconds": 300})
+    assert replay.json()["events"] == p1["events"]
+    # 确认第一批后，新批次的第一条 sequence 紧接 p1
+    client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": p1["delivery_token"]})
+    p2 = client.post(f"/subscriptions/{sid}/poll", json={"limit": 100, "lease_seconds": 30}).json()
+    assert p2["events"][0]["sequence"] == p1["last_sequence"] + 1
+
+
+def test_subscription_dag_filter_only_delivers_matching_events(client):
+    _run_dag_full(client, "sub-f-a")
+    _run_dag_full(client, "sub-f-b")
+    sid = client.post("/subscriptions", json={"dag_id": "sub-f-a"}).json()["id"]
+    body = client.post(f"/subscriptions/{sid}/poll", json={"limit": 100, "lease_seconds": 30}).json()
+    assert body["events"]
+    assert {e["dag_id"] for e in body["events"]} == {"sub-f-a"}
+    client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": body["delivery_token"]})
+    # 过滤订阅追平后，另一个 DAG 的新事件不会投递给它
+    _run_dag_full(client, "sub-f-c")
+    tail = client.post(f"/subscriptions/{sid}/poll", json={"limit": 100, "lease_seconds": 30}).json()
+    assert tail["events"] == []
+
+    # 被过滤 DAG 自己来新事件（用其专属过滤订阅验证过滤口径）
+    sid2 = client.post("/subscriptions", json={"dag_id": "sub-f-c"}).json()["id"]
+    body2 = client.post(f"/subscriptions/{sid2}/poll", json={"limit": 100, "lease_seconds": 30}).json()
+    assert {e["dag_id"] for e in body2["events"]} == {"sub-f-c"} and body2["events"]
+
+
+def test_subscription_poll_validation_and_404(client):
+    sid = client.post("/subscriptions", json={}).json()["id"]
+    # 缺 limit 合法（默认 50）；limit 越界、lease_seconds 非正/缺失均 422
+    assert client.post(f"/subscriptions/{sid}/poll",
+                       json={"lease_seconds": 1}).status_code == 200
+    for bad in ({"limit": 0, "lease_seconds": 1},
+                {"limit": 101, "lease_seconds": 1},
+                {"limit": 1, "lease_seconds": 0},
+                {"limit": 1, "lease_seconds": -5},
+                {"limit": 1}):  # 缺 lease_seconds
+        assert client.post(f"/subscriptions/{sid}/poll", json=bad).status_code == 422, bad
+
+    for method, path in (("GET", "/subscriptions/missing"),
+                         ("POST", "/subscriptions/missing/poll"),
+                         ("POST", "/subscriptions/missing/ack")):
+        r = client.request(method, path, json={"limit": 1, "lease_seconds": 1,
+                                               "delivery_token": "x"})
+        assert r.status_code == 404, (method, path, r.status_code)
+        assert r.json()["error"]["code"] == "subscription_not_found"
+
+
+def test_subscription_list_and_detail(client):
+    _run_dag_full(client, "sub-list-1")
+    s1 = client.post("/subscriptions", json={"dag_id": "sub-list-1"}).json()
+    s2 = client.post("/subscriptions", json={}).json()
+
+    # 在途批次出现在详情与列表中
+    p = client.post(f"/subscriptions/{s1['id']}/poll", json={"limit": 1, "lease_seconds": 300}).json()
+    detail = client.get(f"/subscriptions/{s1['id']}").json()
+    assert detail["id"] == s1["id"]
+    assert detail["dag_id"] == "sub-list-1"
+    inf = detail["in_flight"]
+    assert inf["delivery_token"] == p["delivery_token"]
+    assert inf["last_sequence"] == p["last_sequence"]
+    assert inf["event_count"] == 1
+    assert inf["expired"] is False
+
+    all_subs = client.get("/subscriptions").json()
+    assert all_subs["count"] >= 2
+    ids = {s["id"] for s in all_subs["subscriptions"]}
+    assert {s1["id"], s2["id"]} <= ids
+
+    only = client.get("/subscriptions", params={"dag_id": "sub-list-1"}).json()
+    assert only["count"] == 1 and only["subscriptions"][0]["id"] == s1["id"]
+
+
+def test_subscription_persists_cursor_and_inflight_across_restart(tmp_path, monkeypatch):
+    db_file = tmp_path / "subs.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        _run_dag_full(c1, "sub-restart-1")
+        sid = c1.post("/subscriptions", json={}).json()["id"]
+        p = c1.post(f"/subscriptions/{sid}/poll", json={"limit": 2, "lease_seconds": 300}).json()
+        token = p["delivery_token"]
+        last = p["last_sequence"]
+
+    with TestClient(app) as c2:
+        detail = c2.get(f"/subscriptions/{sid}").json()
+        assert detail["committed_sequence"] == 0
+        assert detail["in_flight"]["delivery_token"] == token
+        assert detail["in_flight"]["last_sequence"] == last
+        assert detail["in_flight"]["expired"] is False
+        # 租约仍有效：重启后重复 poll 原样回放
+        rep = c2.post(f"/subscriptions/{sid}/poll", json={"limit": 99, "lease_seconds": 1})
+        assert rep.json()["delivery_token"] == token
+        assert [e["sequence"] for e in rep.json()["events"]] == [1, 2]
+        # 持久化的令牌仍可确认，游标推进
+        r = c2.post(f"/subscriptions/{sid}/ack", json={"delivery_token": token})
+        assert r.status_code == 200 and r.json()["committed_sequence"] == last
+        assert c2.get(f"/subscriptions/{sid}").json()["committed_sequence"] == last
+        # 列表也在
+        assert c2.get("/subscriptions").json()["count"] >= 1
+
+
+def test_subscription_openapi_documents_endpoints(client):
+    spec = client.get("/openapi.json").json()
+    paths = spec["paths"]
+    assert "post" in paths["/subscriptions"]
+    assert "get" in paths["/subscriptions"]
+    assert "get" in paths["/subscriptions/{subscription_id}"]
+    poll = paths["/subscriptions/{subscription_id}/poll"]["post"]
+    assert {"200", "404"} <= set(poll["responses"])
+    ack = paths["/subscriptions/{subscription_id}/ack"]["post"]
+    assert {"200", "404", "409"} <= set(ack["responses"])
+
+
+def test_existing_events_endpoint_still_works_alongside_subscriptions(client):
+    _run_dag_full(client, "sub-compat-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+    p = client.post(f"/subscriptions/{sid}/poll", json={"limit": 100, "lease_seconds": 30}).json()
+    client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": p["delivery_token"]})
+    # 既有 GET /events 不受影响
+    events = client.get("/events", params={"after": 0, "limit": 100}).json()
+    assert len(events["events"]) == len(p["events"])
+    assert [e["sequence"] for e in events["events"]] == [e["sequence"] for e in p["events"]]

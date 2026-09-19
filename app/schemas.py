@@ -81,3 +81,34 @@ class CompleteIn(BaseModel):
     success: bool
     result: Any = None
     error: str | None = None
+
+
+class SubscriptionIn(BaseModel):
+    dag_id: str | None = Field(
+        None,
+        min_length=1,
+        description="可选：只订阅该 DAG 的事件；缺省（null）订阅全库事件流",
+    )
+    committed_sequence: int = Field(
+        0,
+        ge=0,
+        description="起始游标：只投递 sequence 大于该值的事件；默认 0（从头开始）",
+    )
+
+
+class SubscriptionPollIn(BaseModel):
+    limit: int = Field(50, ge=1, le=100, description="本次最多投递的事件数（1～100）")
+    lease_seconds: float = Field(
+        ...,
+        gt=0,
+        allow_inf_nan=False,
+        description="在途批次的确认租约时长（秒，必须为正）；租约内重复 poll 原样返回同一批次",
+    )
+
+
+class SubscriptionAckIn(BaseModel):
+    delivery_token: str = Field(
+        ...,
+        min_length=1,
+        description="poll 返回的当前批次随机令牌；仅当前令牌可把游标推进到该批最后一条 sequence",
+    )

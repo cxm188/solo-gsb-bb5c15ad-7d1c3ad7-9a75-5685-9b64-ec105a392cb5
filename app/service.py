@@ -1323,6 +1323,22 @@ def list_tasks(dag_id: str | None, state: str | None) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 事件流
 
+def _event_dict(r) -> dict[str, Any]:
+    """events 行 -> 对外事件对象。GET /events 与订阅投递共用同一形态。"""
+    return {
+        "sequence": r["sequence"],
+        "type": r["event_type"],
+        "dag_id": r["dag_id"],
+        "task_id": r["task_id"],
+        "attempt": r["attempt"],
+        "from_state": r["from_state"],
+        "to_state": r["to_state"],
+        # 仅 task.requeued 携带退避后的下次可领时刻；其他事件为 null
+        "next_eligible_at": r["next_eligible_at"],
+        "occurred_at": r["occurred_at"],
+    }
+
+
 def list_events(after: int, limit: int, dag_id: str | None) -> dict[str, Any]:
     """键集分页读取不可变事件流。
 
@@ -1341,21 +1357,239 @@ def list_events(after: int, limit: int, dag_id: str | None) -> dict[str, Any]:
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
 
-    events = [
-        {
-            "sequence": r["sequence"],
-            "type": r["event_type"],
-            "dag_id": r["dag_id"],
-            "task_id": r["task_id"],
-            "attempt": r["attempt"],
-            "from_state": r["from_state"],
-            "to_state": r["to_state"],
-            # 仅 task.requeued 携带退避后的下次可领时刻；其他事件为 null
-            "next_eligible_at": r["next_eligible_at"],
-            "occurred_at": r["occurred_at"],
-        }
-        for r in rows
-    ]
+    events = [_event_dict(r) for r in rows]
     # 非空页游标推进到本页最后一条；空页（无剩余或该 dag_id 下尚无新事件）沿用 after
     next_after = rows[-1]["sequence"] if rows else after
     return {"events": events, "next_after": next_after}
+
+
+# ------------------------------------------------------- 可靠事件订阅
+
+def _fetch_subscription(conn, subscription_id: str):
+    row = conn.execute(
+        "SELECT * FROM subscriptions WHERE id = ?", (subscription_id,)
+    ).fetchone()
+    if row is None:
+        raise APIError(404, "subscription_not_found", f"订阅 {subscription_id} 不存在")
+    return row
+
+
+def _delivery_view(row) -> dict[str, Any] | None:
+    """在途批次视图：expired 按当前时刻动态计算，租约内的批次可继续 ack。"""
+    if row is None:
+        return None
+    expires = _parse(row["lease_expires_at"])
+    return {
+        "delivery_token": row["delivery_token"],
+        "lease_expires_at": row["lease_expires_at"],
+        "expired": expires is not None and expires <= _now(),
+        "last_sequence": row["last_sequence"],
+        "event_count": row["event_count"],
+        "delivered_at": row["delivered_at"],
+    }
+
+
+def _subscription_dict(conn, row) -> dict[str, Any]:
+    delivery = conn.execute(
+        "SELECT * FROM subscription_deliveries WHERE subscription_id = ?",
+        (row["id"],),
+    ).fetchone()
+    return {
+        "id": row["id"],
+        "dag_id": row["dag_id"],
+        "committed_sequence": row["committed_sequence"],
+        "created_at": row["created_at"],
+        "in_flight": _delivery_view(delivery),
+    }
+
+
+def create_subscription(body: dict[str, Any]) -> dict[str, Any]:
+    """创建订阅并固化初始游标 committed_sequence（默认 0，从头订阅）。"""
+    subscription_id = uuid.uuid4().hex
+    now_iso = _iso(_now())
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """INSERT INTO subscriptions (id, dag_id, committed_sequence, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (subscription_id, body.get("dag_id"), int(body["committed_sequence"]), now_iso),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return _subscription_dict(conn, _fetch_subscription(conn, subscription_id))
+
+
+def get_subscription(subscription_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        return _subscription_dict(conn, _fetch_subscription(conn, subscription_id))
+
+
+def list_subscriptions(dag_id: str | None = None) -> dict[str, Any]:
+    sql = "SELECT * FROM subscriptions"
+    params: list[Any] = []
+    if dag_id is not None:
+        sql += " WHERE dag_id = ?"
+        params.append(dag_id)
+    sql += " ORDER BY created_at, id"
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        deliveries = {
+            r["subscription_id"]: r
+            for r in conn.execute("SELECT * FROM subscription_deliveries").fetchall()
+        }
+        items = []
+        for row in rows:
+            view = _subscription_dict(conn, row)
+            # 已预取全部在途行，直接复用（避免逐个订阅再查询）
+            view["in_flight"] = _delivery_view(deliveries.get(row["id"]))
+            items.append(view)
+        return {"subscriptions": items, "count": len(items)}
+
+
+def poll_subscription(subscription_id: str, body: dict[str, Any]) -> dict[str, Any] | ReplayedResponse:
+    """拉取下一批事件；同一订阅同时只允许一个未确认批次。
+
+    - 存在在途批次且租约未过期：逐字节回放首次投递的响应（同令牌、同事件集），
+      请求中的 limit/lease_seconds 不影响回放结果；
+    - 在途批次租约已过期：删除旧批次，以新随机 delivery_token 与新租约重新投递
+      （游标未推进，未确认事件原样重投，绝不跳过）；
+    - 无在途批次：从 committed_sequence 之后按 sequence 升序取至多 limit 条，
+      没有新事件时返回空批次（不生成在途行、不产生令牌）。
+    """
+    limit = int(body["limit"])
+    now = _now()
+    now_iso = _iso(now)
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sub = _fetch_subscription(conn, subscription_id)
+            delivery = conn.execute(
+                "SELECT * FROM subscription_deliveries WHERE subscription_id = ?",
+                (subscription_id,),
+            ).fetchone()
+
+            if delivery is not None:
+                expires = _parse(delivery["lease_expires_at"])
+                if expires is not None and expires > now:
+                    # 租约未过期：同一未确认批次必须原样返回
+                    conn.execute("ROLLBACK")
+                    return ReplayedResponse(200, delivery["response_body"])
+                # 租约已过期：旧批次失效，允许重新投递（在同一写事务内删除）
+                conn.execute(
+                    "DELETE FROM subscription_deliveries WHERE subscription_id = ?",
+                    (subscription_id,),
+                )
+
+            sql = "SELECT * FROM events WHERE sequence > ?"
+            params: list[Any] = [sub["committed_sequence"]]
+            if sub["dag_id"] is not None:
+                sql += " AND dag_id = ?"
+                params.append(sub["dag_id"])
+            sql += " ORDER BY sequence ASC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+
+            if not rows:
+                # 无新事件：空批次不占用在途槽位，也不产生令牌；游标保持不变
+                conn.execute("COMMIT")
+                return {
+                    "subscription_id": subscription_id,
+                    "delivery_token": None,
+                    "lease_expires_at": None,
+                    "events": [],
+                    "last_sequence": sub["committed_sequence"],
+                    "committed_sequence": sub["committed_sequence"],
+                }
+
+            token = uuid.uuid4().hex
+            lease_expires_at = _iso(now + timedelta(seconds=float(body["lease_seconds"])))
+            events = [_event_dict(r) for r in rows]
+            last_sequence = rows[-1]["sequence"]
+            response = {
+                "subscription_id": subscription_id,
+                "delivery_token": token,
+                "lease_expires_at": lease_expires_at,
+                "events": events,
+                "last_sequence": last_sequence,
+                "committed_sequence": sub["committed_sequence"],
+            }
+            response_body = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+            conn.execute(
+                """INSERT INTO subscription_deliveries
+                       (subscription_id, delivery_token, lease_expires_at, last_sequence,
+                        event_count, delivered_at, response_body)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    subscription_id,
+                    token,
+                    lease_expires_at,
+                    last_sequence,
+                    len(rows),
+                    now_iso,
+                    response_body,
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return response
+
+
+def ack_subscription(subscription_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """凭当前 delivery_token 确认在途批次，游标推进到该批最后一条 sequence。
+
+    仅接受在途批次的当前令牌：没有在途批次（从未投递、已确认或租约过期未重投）、
+    令牌旧（批次过期后已重新投递生成新令牌）或令牌错误一律 409，且游标保持不动——
+    游标只能推进到当前在途批次的最后一条，绝不可能越过任何未确认事件。
+    """
+    token = body["delivery_token"]
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sub = _fetch_subscription(conn, subscription_id)
+            delivery = conn.execute(
+                "SELECT * FROM subscription_deliveries WHERE subscription_id = ?",
+                (subscription_id,),
+            ).fetchone()
+            if delivery is None:
+                raise APIError(
+                    409,
+                    "no_pending_batch",
+                    "没有待确认的投递批次：可能已确认、尚未 poll 或租约已过期",
+                )
+            if delivery["delivery_token"] != token:
+                raise APIError(
+                    409,
+                    "invalid_delivery_token",
+                    "delivery_token 与当前在途批次不匹配（旧令牌或错误令牌）",
+                )
+            # 游标只可能推进到该批最后一条 sequence；批次窗口从
+            # committed_sequence 之后开始，天然不可能越过未确认事件
+            committed = delivery["last_sequence"]
+            if committed < sub["committed_sequence"]:  # pragma: no cover - 防御外部写入倒退
+                raise APIError(
+                    409,
+                    "cursor_would_go_backwards",
+                    "确认批次落后于已提交游标",
+                )
+            conn.execute(
+                "UPDATE subscriptions SET committed_sequence = ? WHERE id = ?",
+                (committed, subscription_id),
+            )
+            conn.execute(
+                "DELETE FROM subscription_deliveries WHERE subscription_id = ?",
+                (subscription_id,),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    return {"subscription_id": subscription_id, "committed_sequence": committed}
