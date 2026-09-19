@@ -159,6 +159,35 @@ def init_db(path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, attempt_no);
             CREATE INDEX IF NOT EXISTS idx_events_dag_seq ON events(dag_id, sequence);
 
+            -- 可靠事件订阅：复用 events.sequence 作为全局游标。
+            -- committed_sequence 为已确认（ack）到的最大 sequence：创建时保存事件流
+            -- 当前顶（默认只收创建之后的事件），仅由当前在途批次的 ack 原子推进。
+            -- dag_id 可空：非空时只投递该 DAG 的事件（游标口径仍是全局 sequence）。
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id                  TEXT PRIMARY KEY,
+                dag_id              TEXT,
+                committed_sequence  INTEGER NOT NULL,
+                created_at          TEXT NOT NULL
+            );
+
+            -- 在途（未确认）投递批次：每个订阅至多一行（PRIMARY KEY = 订阅 id），
+            -- 即同一订阅同时只允许一个未确认批次。行由 poll 创建、ack 删除；
+            -- 租约过期后下一次 poll 删除旧行并以新随机令牌/新租约重新投递。
+            -- response_body 保存首次投递的原始 JSON 响应：租约未过期时重复 poll
+            -- 逐字节原样回放，忽略当次请求的 limit/lease_seconds。
+            CREATE TABLE IF NOT EXISTS subscription_deliveries (
+                subscription_id   TEXT PRIMARY KEY REFERENCES subscriptions(id),
+                delivery_token    TEXT NOT NULL,
+                first_sequence    INTEGER NOT NULL,
+                last_sequence     INTEGER NOT NULL,
+                event_count       INTEGER NOT NULL,
+                leased_at         TEXT NOT NULL,
+                lease_expires_at  TEXT NOT NULL,
+                response_body     TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_created ON subscriptions(created_at);
+
             -- 事件流不可变：任何 UPDATE/DELETE 都被中止（INSERT 与事务回滚不受影响）
             CREATE TRIGGER IF NOT EXISTS events_no_update
             BEFORE UPDATE ON events

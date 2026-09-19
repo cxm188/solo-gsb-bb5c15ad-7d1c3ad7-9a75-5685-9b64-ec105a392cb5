@@ -2382,3 +2382,447 @@ def test_cancel_works_on_legacy_sqlite_db(tmp_path, monkeypatch):
         service.cancel_task("t1")
     assert exc.value.status_code == 409
     assert len(service.list_events(0, 50, None)["events"]) == len(events)
+
+
+# ------------------------------------------------------------- 可靠事件订阅
+
+def _create_sub(client, dag_id=None, committed_sequence=None):
+    body = {}
+    if dag_id is not None:
+        body["dag_id"] = dag_id
+    if committed_sequence is not None:
+        body["committed_sequence"] = committed_sequence
+    r = client.post("/subscriptions", json=body)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _poll(client, sub_id, **body):
+    body.setdefault("lease_seconds", 30)
+    return client.post(f"/subscriptions/{sub_id}/poll", json=body)
+
+
+def _ack(client, sub_id, token):
+    return client.post(f"/subscriptions/{sub_id}/ack", json={"delivery_token": token})
+
+
+def test_create_subscription_defaults_to_stream_head(client):
+    """缺省 committed_sequence 保存事件流当前顶：历史事件不补投，只收新事件。"""
+    submit(client, [{"key": "a"}], dag_id="sub-1")
+    head = client.get("/events", params={"limit": 100}).json()["events"][-1]["sequence"]
+
+    sub = _create_sub(client)
+    assert sub["dag_id"] is None
+    assert sub["committed_sequence"] == head  # 保存创建时的当前顶
+    assert sub["pending_delivery"] is None
+
+    # 此时 poll 为空批
+    p = _poll(client, sub["id"]).json()
+    assert p["events"] == [] and p["count"] == 0
+    assert p["delivery_token"] is None and p["lease_expires_at"] is None
+    assert p["committed_sequence"] == head
+
+
+def test_create_subscription_empty_stream_starts_at_zero(client):
+    sub = _create_sub(client)
+    assert sub["committed_sequence"] == 0
+
+    # 创建之后的首个事件可被投递
+    submit(client, [{"key": "a"}], dag_id="sub-empty")
+    p = _poll(client, sub["id"]).json()
+    assert [e["type"] for e in p["events"]] == ["dag.created"]
+
+
+def test_create_subscription_explicit_committed_sequence_replays(client):
+    submit(client, [{"key": "a"}, {"key": "b"}], dag_id="sub-replay")
+    events = client.get("/events", params={"dag_id": "sub-replay", "limit": 100}).json()["events"]
+    assert len(events) == 1  # 一条 dag.created
+
+    # 显式从 0 开始：补投历史事件
+    sub = _create_sub(client, committed_sequence=0)
+    p = _poll(client, sub["id"], limit=10).json()
+    assert [e["sequence"] for e in p["events"]] == [events[0]["sequence"]]
+
+    # committed_sequence 不允许负数
+    assert client.post("/subscriptions", json={"committed_sequence": -1}).status_code == 422
+
+
+def test_subscription_poll_ack_advances_cursor_in_order(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="sub-flow")
+    sub = _create_sub(client, committed_sequence=0)
+
+    # 首批：dag.created
+    p1 = _poll(client, sub["id"], limit=2, lease_seconds=30).json()
+    assert len(p1["events"]) == 1  # 目前只有 dag.created
+    assert p1["events"][0]["type"] == "dag.created"
+    token1 = p1["delivery_token"]
+    assert token1 and len(token1) >= 16
+    assert p1["lease_expires_at"] is not None and p1["delivered_at"] is not None
+    assert p1["committed_sequence"] == 0
+    # 事件对象口径与 GET /events 一致
+    direct = client.get("/events", params={"after": 0, "limit": 1}).json()["events"][0]
+    assert p1["events"][0] == direct
+
+    # 在途未确认：即使产生了新事件，重复 poll 仍返回原批
+    t = client.post("/tasks/claim", json={"dag_id": "sub-flow"}).json()["claimed"][0]
+    p1b = _poll(client, sub["id"], limit=100, lease_seconds=1).json()
+    assert [e["sequence"] for e in p1b["events"]] == [p1["events"][0]["sequence"]]
+    assert p1b["delivery_token"] == token1
+
+    # ack 推进游标到本批最后 sequence
+    r = _ack(client, sub["id"], token1)
+    assert r.status_code == 200
+    assert r.json()["committed_sequence"] == p1["events"][-1]["sequence"]
+    assert r.json()["pending_delivery"] is None
+
+    # 下一批按序返回新事件
+    p2 = _poll(client, sub["id"], limit=10, lease_seconds=30).json()
+    assert p2["events"][0]["type"] == "task.claimed"
+    assert p2["committed_sequence"] == p1["events"][-1]["sequence"]
+    assert p2["events"][0]["sequence"] > p1["events"][-1]["sequence"]
+    assert p2["delivery_token"] != token1  # 每批新随机令牌
+
+
+def test_repeated_poll_within_lease_replays_identical_bytes(client):
+    submit(client, [{"key": "a"}], dag_id="sub-replay2")
+    sub = _create_sub(client, committed_sequence=0)
+    first = _poll(client, sub["id"], limit=10, lease_seconds=60)
+    # 用不同的 limit/lease_seconds 重复 poll，租约未过期必须逐字节原样回放
+    again = _poll(client, sub["id"], limit=1, lease_seconds=1)
+    assert again.status_code == 200
+    assert again.text == first.text
+
+
+def test_wrong_and_old_tokens_return_409(client):
+    submit(client, [{"key": "a"}], dag_id="sub-tok")
+    sub = _create_sub(client, committed_sequence=0)
+    token = _poll(client, sub["id"]).json()["delivery_token"]
+
+    # 错误令牌 -> 409，游标不动
+    r = _ack(client, sub["id"], "definitely-wrong-token")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_delivery_token"
+    detail = client.get(f"/subscriptions/{sub['id']}").json()
+    assert detail["committed_sequence"] == 0
+    assert detail["pending_delivery"]["delivery_token"] == token
+
+    # 无在途批次时 ack -> 409 no_pending_delivery
+    assert _ack(client, sub["id"], token).status_code == 200
+    r = _ack(client, sub["id"], token)
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "no_pending_delivery"
+
+
+def test_ack_without_pending_delivery_returns_409(client):
+    sub = _create_sub(client)
+    r = _ack(client, sub["id"], "whatever")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "no_pending_delivery"
+
+
+def test_poll_filters_by_dag_id_but_cursor_stays_global(client):
+    submit(client, [{"key": "a"}], dag_id="sub-f1")
+    submit(client, [{"key": "z"}], dag_id="sub-f2")
+
+    sub = _create_sub(client, dag_id="sub-f1", committed_sequence=0)
+    p = _poll(client, sub["id"], limit=10).json()
+    assert {e["dag_id"] for e in p["events"]} == {"sub-f1"}
+    assert [e["type"] for e in p["events"]] == ["dag.created"]
+    _ack(client, sub["id"], p["delivery_token"])
+    assert client.get(f"/subscriptions/{sub['id']}").json()["committed_sequence"] == 1
+
+    # d2 产生事件：过滤订阅的 poll 为空批；游标是全局 sequence，空批不前进
+    client.post("/tasks/claim", json={"dag_id": "sub-f2"})
+    p = _poll(client, sub["id"], limit=10).json()
+    assert p["events"] == []
+    assert p["committed_sequence"] == 1
+
+    claimed = client.post("/tasks/claim", json={"dag_id": "sub-f1"}).json()["claimed"][0]
+    client.post(
+        f"/tasks/{claimed['task_id']}/complete",
+        json={"completion_id": "ok-f1", "lease_token": claimed["lease_token"], "success": True},
+    )
+    p = _poll(client, sub["id"], limit=10).json()
+    assert {e["dag_id"] for e in p["events"]} == {"sub-f1"}
+    assert [e["type"] for e in p["events"]] == ["task.claimed", "task.succeeded"]
+
+    # 不过滤的订阅能同时看到两个 DAG
+    sub_all = _create_sub(client, committed_sequence=0)
+    p = _poll(client, sub_all["id"], limit=100).json()
+    assert {e["dag_id"] for e in p["events"]} == {"sub-f1", "sub-f2"}
+
+
+def test_expired_lease_allows_redelivery_with_new_token(client):
+    submit(client, [{"key": "a"}], dag_id="sub-exp")
+    sub = _create_sub(client, committed_sequence=0)
+
+    p1 = _poll(client, sub["id"], lease_seconds=0.2).json()
+    old_token = p1["delivery_token"]
+    assert [e["sequence"] for e in p1["events"]] == [1]
+
+    # 租约未过期重复 poll 不换令牌
+    p_replay = _poll(client, sub["id"], lease_seconds=0.2).json()
+    assert p_replay["delivery_token"] == old_token
+
+    time.sleep(0.25)
+    # 过期后重新投递：同一未确认批次从头再投，新随机令牌、新租约
+    p2 = _poll(client, sub["id"], limit=10, lease_seconds=30).json()
+    assert p2["delivery_token"] != old_token
+    assert [e["sequence"] for e in p2["events"]] == [1]
+
+    # 旧令牌作废 -> 409；新令牌可 ack
+    r = _ack(client, sub["id"], old_token)
+    assert r.status_code == 409 and r.json()["error"]["code"] == "invalid_delivery_token"
+    r = _ack(client, sub["id"], p2["delivery_token"])
+    assert r.status_code == 200
+    assert r.json()["committed_sequence"] == 1
+
+    # 游标推进后，重新投递不会再出现已确认事件
+    p3 = _poll(client, sub["id"], lease_seconds=30).json()
+    assert p3["events"] == [] and p3["delivery_token"] is None
+
+
+def test_expired_lease_redelivery_fetches_new_limit_window(client):
+    """过期重投从游标处重新查询：新 poll 的 limit 生效，未确认事件永不跳过。"""
+    # 3 个事件
+    submit(client, [{"key": "a"}], dag_id="sub-win")
+    sub = _create_sub(client, committed_sequence=0)
+    p1 = _poll(client, sub["id"], limit=1, lease_seconds=0.2).json()
+    assert [e["sequence"] for e in p1["events"]] == [1]
+    time.sleep(0.25)
+    # 过期后以更大 limit 重投：仍从游标 0 开始，覆盖未确认的 1，并取更多
+    p2 = _poll(client, sub["id"], limit=10, lease_seconds=30).json()
+    seqs = [e["sequence"] for e in p2["events"]]
+    assert seqs[0] == 1 and seqs == sorted(seqs) and len(seqs) >= 1
+    _ack(client, sub["id"], p2["delivery_token"])
+    detail = client.get(f"/subscriptions/{sub['id']}").json()
+    assert detail["committed_sequence"] == seqs[-1]
+
+
+def test_subscription_pagination_limit_batching_and_no_gaps(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="sub-batch")
+    for _ in range(2):
+        claimed = client.post("/tasks/claim", json={"dag_id": "sub-batch", "limit": 10}).json()["claimed"]
+        for t in claimed:
+            client.post(
+                f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": f"ok-{t['task_id']}",
+                      "lease_token": t["lease_token"], "success": True},
+            )
+    expected = [e["sequence"] for e in client.get("/events", params={"limit": 100}).json()["events"]]
+    assert len(expected) == 5  # dag.created + a(claimed/succeeded) + b(claimed/succeeded)
+
+    sub = _create_sub(client, committed_sequence=0)
+    delivered = []
+    # limit=1 逐批拉完整个流，断言无重复无遗漏
+    while True:
+        p = _poll(client, sub["id"], limit=1, lease_seconds=30).json()
+        if not p["events"]:
+            break
+        assert len(p["events"]) == 1
+        delivered.append(p["events"][0]["sequence"])
+        r = _ack(client, sub["id"], p["delivery_token"])
+        assert r.status_code == 200
+    assert delivered == expected
+
+
+def test_concurrent_poll_delivers_single_batch(client):
+    submit(client, [{"key": "a"}], dag_id="sub-conc")
+    sub = _create_sub(client, committed_sequence=0)
+    tokens = []
+    errors = []
+
+    def worker():
+        try:
+            r = _poll(client, sub["id"], lease_seconds=30)
+            tokens.append(r.json()["delivery_token"])
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert not errors
+    # 同一时刻只有一个在途批次：所有 poll 看到同一个 token
+    assert len(set(tokens)) == 1 and tokens[0] is not None
+
+
+def test_poll_validates_params(client):
+    sub = _create_sub(client)
+    assert _poll(client, sub["id"], limit=0).status_code == 422
+    assert _poll(client, sub["id"], limit=101).status_code == 422
+    assert _poll(client, sub["id"], lease_seconds=0).status_code == 422
+    assert _poll(client, sub["id"], lease_seconds=-5).status_code == 422
+    # lease_seconds 必填
+    assert client.post(f"/subscriptions/{sub['id']}/poll", json={"limit": 10}).status_code == 422
+    # ack 必须携带非空 token
+    assert client.post(f"/subscriptions/{sub['id']}/ack", json={}).status_code == 422
+    assert client.post(f"/subscriptions/{sub['id']}/ack", json={"delivery_token": ""}).status_code == 422
+
+
+def test_subscription_endpoints_404_for_unknown_id(client):
+    assert client.post("/subscriptions/nope/poll", json={"lease_seconds": 5}).status_code == 404
+    r = client.post("/subscriptions/nope/ack", json={"delivery_token": "x"})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "subscription_not_found"
+    assert client.get("/subscriptions/nope").status_code == 404
+
+
+def test_list_and_detail_subscription_views(client):
+    submit(client, [{"key": "a"}], dag_id="sub-view")
+    s1 = _create_sub(client, dag_id="sub-view", committed_sequence=0)
+    s2 = _create_sub(client)
+
+    p = _poll(client, s1["id"], limit=10, lease_seconds=60).json()
+    assert p["count"] == 1
+
+    # 详情含完整在途批次（含事件内容）
+    detail = client.get(f"/subscriptions/{s1['id']}").json()
+    pd = detail["pending_delivery"]
+    assert pd["delivery_token"] == p["delivery_token"]
+    assert pd["first_sequence"] == pd["last_sequence"] == p["events"][0]["sequence"]
+    assert pd["event_count"] == 1
+    assert pd["lease_expires_at"] == p["lease_expires_at"]
+    assert pd["expired"] is False
+    assert [e["sequence"] for e in pd["events"]] == [p["events"][0]["sequence"]]
+
+    # 无在途批次的订阅 pending_delivery 为 null
+    detail2 = client.get(f"/subscriptions/{s2['id']}").json()
+    assert detail2["pending_delivery"] is None
+
+    # 列表含全部订阅（摘要，不带 events 键）
+    lst = client.get("/subscriptions").json()
+    assert lst["count"] == 2
+    assert {s["id"] for s in lst["subscriptions"]} == {s1["id"], s2["id"]}
+    pd_summary = next(s for s in lst["subscriptions"] if s["id"] == s1["id"])["pending_delivery"]
+    assert pd_summary["delivery_token"] == p["delivery_token"]
+    assert "events" not in pd_summary
+
+    # 列表可按 dag_id 过滤
+    lst = client.get("/subscriptions", params={"dag_id": "sub-view"}).json()
+    assert [s["id"] for s in lst["subscriptions"]] == [s1["id"]]
+    assert client.get("/subscriptions", params={"dag_id": "other"}).json()["count"] == 0
+
+
+def test_pending_delivery_shows_expired_after_lease(client):
+    submit(client, [{"key": "a"}], dag_id="sub-expview")
+    sub = _create_sub(client, committed_sequence=0)
+    _poll(client, sub["id"], lease_seconds=0.2)
+    time.sleep(0.25)
+    detail = client.get(f"/subscriptions/{sub['id']}").json()
+    assert detail["pending_delivery"]["expired"] is True
+    # 游标在重新投递/确认前保持不动
+    assert detail["committed_sequence"] == 0
+
+
+def test_subscriptions_persist_across_restart(tmp_path, monkeypatch):
+    """订阅、在途批次与游标全部持久化：重启后租约/回放/确认语义不变。"""
+    db_file = tmp_path / "subs.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        submit(c1, [{"key": "a"}], dag_id="sub-restart")
+        sub = _create_sub(c1, committed_sequence=0)
+        first = _poll(c1, sub["id"], limit=10, lease_seconds=300)
+        token = first.json()["delivery_token"]
+        seqs = [e["sequence"] for e in first.json()["events"]]
+        assert seqs == [1]
+
+    # 重启：长租约仍未过期，重复 poll 必须逐字节回放同一批次
+    with TestClient(app) as c2:
+        again = _poll(c2, sub["id"], limit=1, lease_seconds=1)
+        assert again.status_code == 200 and again.text == first.text
+        assert again.json()["delivery_token"] == token
+
+        # 列表/详情中的在途批次仍在
+        detail = c2.get(f"/subscriptions/{sub['id']}").json()
+        assert detail["pending_delivery"]["delivery_token"] == token
+        assert detail["committed_sequence"] == 0
+
+        # 用重启前拿到的令牌 ack：游标推进并持久化
+        r = _ack(c2, sub["id"], token)
+        assert r.status_code == 200 and r.json()["committed_sequence"] == 1
+
+    # 再次重启确认游标已落库，旧事件不再投递
+    with TestClient(app) as c3:
+        detail = c3.get(f"/subscriptions/{sub['id']}").json()
+        assert detail["committed_sequence"] == 1 and detail["pending_delivery"] is None
+        p = _poll(c3, sub["id"], lease_seconds=30).json()
+        assert p["events"] == [] and p["delivery_token"] is None
+        lst = c3.get("/subscriptions").json()
+        assert lst["count"] == 1 and lst["subscriptions"][0]["dag_id"] is None
+
+
+def test_expired_in_flight_batch_survives_restart_and_redelivers(tmp_path, monkeypatch):
+    """重启跨过租约过期时刻：旧批次仍持久化，过期后以新令牌重新投递同一事件。"""
+    db_file = tmp_path / "subs-exp.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        submit(c1, [{"key": "a"}], dag_id="sub-re-exp")
+        sub = _create_sub(c1, committed_sequence=0)
+        old = _poll(c1, sub["id"], lease_seconds=0.2).json()
+        old_token = old["delivery_token"]
+
+    time.sleep(0.25)
+    with TestClient(app) as c2:
+        detail = c2.get(f"/subscriptions/{sub['id']}").json()
+        assert detail["pending_delivery"]["expired"] is True
+        redelivered = _poll(c2, sub["id"], limit=10, lease_seconds=30).json()
+        assert redelivered["delivery_token"] != old_token
+        assert [e["sequence"] for e in redelivered["events"]] == [1]
+        assert _ack(c2, sub["id"], old_token).status_code == 409
+        assert _ack(c2, sub["id"], redelivered["delivery_token"]).status_code == 200
+
+
+def test_dag_filtered_subscription_restart_and_replay(tmp_path, monkeypatch):
+    db_file = tmp_path / "subs-dag.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        submit(c1, [{"key": "a"}], dag_id="sub-d1")
+        submit(c1, [{"key": "z"}], dag_id="sub-d2")
+        sub = _create_sub(c1, dag_id="sub-d1", committed_sequence=0)
+
+    with TestClient(app) as c2:
+        p = _poll(c2, sub["id"], limit=100, lease_seconds=30).json()
+        assert {e["dag_id"] for e in p["events"]} == {"sub-d1"}
+        detail = c2.get(f"/subscriptions/{sub['id']}").json()
+        assert detail["dag_id"] == "sub-d1"
+
+
+def test_events_endpoint_unchanged_with_subscriptions(client):
+    """订阅机制不产生事件、不改变既有 GET /events 行为。"""
+    submit(client, [{"key": "a"}], dag_id="sub-noevt")
+    before = client.get("/events", params={"limit": 100}).json()
+    sub = _create_sub(client, committed_sequence=0)
+    _poll(client, sub["id"], lease_seconds=30)
+    _ack(client, sub["id"], client.get(f"/subscriptions/{sub['id']}").json()["pending_delivery"]["delivery_token"])
+    after = client.get("/events", params={"limit": 100}).json()
+    assert [e["sequence"] for e in after["events"]] == [e["sequence"] for e in before["events"]]
+    # 再次 poll 为空
+    assert _poll(client, sub["id"], lease_seconds=30).json()["events"] == []
+
+
+def test_openapi_documents_subscription_endpoints(client):
+    spec = client.get("/openapi.json").json()
+    assert "/subscriptions" in spec["paths"]
+    assert "/subscriptions/{subscription_id}/poll" in spec["paths"]
+    assert "/subscriptions/{subscription_id}/ack" in spec["paths"]
+    poll = spec["paths"]["/subscriptions/{subscription_id}/poll"]["post"]
+    assert "200" in poll["responses"] and "404" in poll["responses"]
+    ack = spec["paths"]["/subscriptions/{subscription_id}/ack"]["post"]
+    assert "200" in ack["responses"] and "404" in ack["responses"] and "409" in ack["responses"]

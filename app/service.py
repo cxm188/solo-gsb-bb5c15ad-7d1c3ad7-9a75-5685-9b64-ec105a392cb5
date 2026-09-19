@@ -1323,6 +1323,22 @@ def list_tasks(dag_id: str | None, state: str | None) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 事件流
 
+def _event_dict(r) -> dict[str, Any]:
+    """事件行 -> API 事件对象。/events 只读流与订阅投递共用，保证字段口径一致。"""
+    return {
+        "sequence": r["sequence"],
+        "type": r["event_type"],
+        "dag_id": r["dag_id"],
+        "task_id": r["task_id"],
+        "attempt": r["attempt"],
+        "from_state": r["from_state"],
+        "to_state": r["to_state"],
+        # 仅 task.requeued 携带退避后的下次可领时刻；其他事件为 null
+        "next_eligible_at": r["next_eligible_at"],
+        "occurred_at": r["occurred_at"],
+    }
+
+
 def list_events(after: int, limit: int, dag_id: str | None) -> dict[str, Any]:
     """键集分页读取不可变事件流。
 
@@ -1341,21 +1357,279 @@ def list_events(after: int, limit: int, dag_id: str | None) -> dict[str, Any]:
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
 
-    events = [
-        {
-            "sequence": r["sequence"],
-            "type": r["event_type"],
-            "dag_id": r["dag_id"],
-            "task_id": r["task_id"],
-            "attempt": r["attempt"],
-            "from_state": r["from_state"],
-            "to_state": r["to_state"],
-            # 仅 task.requeued 携带退避后的下次可领时刻；其他事件为 null
-            "next_eligible_at": r["next_eligible_at"],
-            "occurred_at": r["occurred_at"],
-        }
-        for r in rows
-    ]
+    events = [_event_dict(r) for r in rows]
     # 非空页游标推进到本页最后一条；空页（无剩余或该 dag_id 下尚无新事件）沿用 after
     next_after = rows[-1]["sequence"] if rows else after
     return {"events": events, "next_after": next_after}
+
+
+# ---------------------------------------------------------------- 可靠事件订阅
+
+def _fetch_subscription_events(
+    conn, after: int, dag_id: str | None, limit: int
+) -> list:
+    """在调用方事务内按游标顺序取下一批事件；口径与 GET /events 完全一致。"""
+    sql = "SELECT * FROM events WHERE sequence > ?"
+    params: list[Any] = [after]
+    if dag_id is not None:
+        sql += " AND dag_id = ?"
+        params.append(dag_id)
+    sql += " ORDER BY sequence ASC LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def _pending_delivery_dict(row, with_events: bool) -> dict[str, Any] | None:
+    """在途批次视图。过期只影响能否重复投递/当前令牌是否仍可 ack——游标在
+    ack/重新投递前保持不动，因此 expired 仅为状态展示字段。"""
+    if row is None:
+        return None
+    expires = _parse(row["lease_expires_at"])
+    pending = {
+        "delivery_token": row["delivery_token"],
+        "first_sequence": row["first_sequence"],
+        "last_sequence": row["last_sequence"],
+        "event_count": row["event_count"],
+        "leased_at": row["leased_at"],
+        "lease_expires_at": row["lease_expires_at"],
+        "expired": expires is not None and expires <= _now(),
+    }
+    # 详情接口需要批次内容用于观察/诊断；列表接口只给摘要
+    if with_events:
+        pending["events"] = json.loads(row["response_body"])["events"]
+    return pending
+
+
+def _subscription_dict(conn, row, with_events: bool = False) -> dict[str, Any]:
+    delivery = conn.execute(
+        "SELECT * FROM subscription_deliveries WHERE subscription_id = ?",
+        (row["id"],),
+    ).fetchone()
+    return {
+        "id": row["id"],
+        "dag_id": row["dag_id"],
+        "committed_sequence": row["committed_sequence"],
+        "created_at": row["created_at"],
+        "pending_delivery": _pending_delivery_dict(delivery, with_events),
+    }
+
+
+def create_subscription(body: dict[str, Any]) -> dict[str, Any]:
+    """创建订阅。
+
+    committed_sequence 默认取事件流当前顶（MAX(sequence)，空流为 0）：语义为
+    「从现在起」只投递之后的新事件，创建之前的历史事件不补投。显式传入
+    committed_sequence（>=0）可回放更早的事件。dag_id 可选：非空时只投递该
+    DAG 的事件，游标口径仍是全局 sequence。
+    """
+    dag_id = body.get("dag_id")
+    requested_seq = body.get("committed_sequence")
+    sub_id = uuid.uuid4().hex
+    now_iso = _iso(_now())
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            head = conn.execute("SELECT MAX(sequence) AS m FROM events").fetchone()["m"]
+            head = head or 0
+            # 缺省：当前顶（只收新事件）。显式值允许超过当前顶（等待未来事件追上），
+            # 与 GET /events 的 after 参数口径一致。
+            committed = head if requested_seq is None else requested_seq
+            conn.execute(
+                """INSERT INTO subscriptions (id, dag_id, committed_sequence, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (sub_id, dag_id, committed, now_iso),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return get_subscription(sub_id)
+
+
+def get_subscription(sub_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM subscriptions WHERE id = ?", (sub_id,)
+        ).fetchone()
+        if row is None:
+            raise APIError(404, "subscription_not_found", f"订阅 {sub_id} 不存在")
+        return _subscription_dict(conn, row, with_events=True)
+
+
+def list_subscriptions(dag_id: str | None) -> dict[str, Any]:
+    with get_conn() as conn:
+        if dag_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM subscriptions WHERE dag_id = ? ORDER BY created_at, id",
+                (dag_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM subscriptions ORDER BY created_at, id"
+            ).fetchall()
+        return {
+            "subscriptions": [_subscription_dict(conn, r) for r in rows],
+            "count": len(rows),
+        }
+
+
+def _load_subscription_row(conn, sub_id: str):
+    row = conn.execute(
+        "SELECT * FROM subscriptions WHERE id = ?", (sub_id,)
+    ).fetchone()
+    if row is None:
+        raise APIError(404, "subscription_not_found", f"订阅 {sub_id} 不存在")
+    return row
+
+
+def poll_subscription(sub_id: str, body: dict[str, Any]) -> dict[str, Any] | ReplayedResponse:
+    """取下一批事件并附随机投递令牌与租约。
+
+    - 存在在途批次且租约未过期：忽略本次 limit/lease_seconds，原样回放首次投递
+      保存的响应体（同 token、同事件、同租约过期时刻），保证重复 poll 幂等。
+    - 存在在途批次但租约已过期：删除旧批次，从游标 committed_sequence 起重新
+      查询下一批（游标从未被推进，因此必然覆盖此前未确认的事件，不漏不越），
+      生成新随机 delivery_token 与新租约。
+    - 无在途批次：从游标 committed_sequence 起查下一批；无新事件时返回空批
+      （不产生令牌/租约/在途记录）。
+    """
+    limit = body["limit"]
+    lease_seconds = body["lease_seconds"]
+    now = _now()
+    now_iso = _iso(now)
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sub = _load_subscription_row(conn, sub_id)
+            delivery = conn.execute(
+                "SELECT * FROM subscription_deliveries WHERE subscription_id = ?",
+                (sub_id,),
+            ).fetchone()
+
+            if delivery is not None and _parse(delivery["lease_expires_at"]) > now:
+                # 租约未过期：逐字节原样回放该批次，不续租、不换 token
+                conn.execute("ROLLBACK")
+                return ReplayedResponse(200, delivery["response_body"])
+
+            if delivery is not None:
+                # 旧批次租约已过期：清除后按同一游标重新投递（新令牌/新租约）
+                conn.execute(
+                    "DELETE FROM subscription_deliveries WHERE subscription_id = ?",
+                    (sub_id,),
+                )
+
+            rows = _fetch_subscription_events(
+                conn, sub["committed_sequence"], sub["dag_id"], limit
+            )
+            if not rows:
+                # 无新事件：空批，不创建在途记录；游标保持不变
+                conn.execute("COMMIT")
+                return {
+                    "subscription_id": sub_id,
+                    "events": [],
+                    "count": 0,
+                    "delivery_token": None,
+                    "lease_seconds": lease_seconds,
+                    "delivered_at": None,
+                    "lease_expires_at": None,
+                    "committed_sequence": sub["committed_sequence"],
+                }
+
+            token = uuid.uuid4().hex
+            expires = now + timedelta(seconds=lease_seconds)
+            expires_iso = _iso(expires)
+            events = [_event_dict(r) for r in rows]
+            response = {
+                "subscription_id": sub_id,
+                "events": events,
+                "count": len(events),
+                "delivery_token": token,
+                "lease_seconds": lease_seconds,
+                "delivered_at": now_iso,
+                "lease_expires_at": expires_iso,
+                "committed_sequence": sub["committed_sequence"],
+            }
+            # 保存首次投递的原始 JSON 文本：未过期重复 poll 逐字节回放
+            body_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+            conn.execute(
+                """INSERT INTO subscription_deliveries
+                       (subscription_id, delivery_token, first_sequence, last_sequence,
+                        event_count, leased_at, lease_expires_at, response_body)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    sub_id,
+                    token,
+                    rows[0]["sequence"],
+                    rows[-1]["sequence"],
+                    len(rows),
+                    now_iso,
+                    expires_iso,
+                    body_text,
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    return response
+
+
+def ack_subscription(sub_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """确认当前在途批次：仅接受当前（与存储的在途行一致的）delivery_token。
+
+    匹配则在同一事务内把 committed_sequence 推进到该批最后一条事件的
+    sequence 并删除在途行；之后的 poll 从新游标继续。旧令牌（租约过期后重新
+    投递已换发新令牌）、错误/伪造令牌一律 409；不存在在途批次时 409。
+    推进目标恒为游标之后紧接的一批——不可能越过任何未确认事件。
+    """
+    token = body["delivery_token"]
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sub = _load_subscription_row(conn, sub_id)
+            delivery = conn.execute(
+                "SELECT * FROM subscription_deliveries WHERE subscription_id = ?",
+                (sub_id,),
+            ).fetchone()
+            if delivery is None:
+                conn.execute("ROLLBACK")
+                raise APIError(
+                    409,
+                    "no_pending_delivery",
+                    "该订阅当前没有在途批次，无需确认",
+                    {"subscription_id": sub_id},
+                )
+            if delivery["delivery_token"] != token:
+                # 旧 token（过期重新投递后作废）或错误 token：拒绝且游标不动
+                conn.execute("ROLLBACK")
+                raise APIError(
+                    409,
+                    "invalid_delivery_token",
+                    "投递令牌无效或已过期作废：只有当前在途批次的令牌可以确认",
+                    {"subscription_id": sub_id},
+                )
+
+            new_committed = delivery["last_sequence"]
+            # 防御性不变量：确认只能向前推进，且必须紧接当前游标，绝不跳过事件
+            assert new_committed >= sub["committed_sequence"]
+            assert delivery["first_sequence"] > sub["committed_sequence"]
+            conn.execute(
+                "UPDATE subscriptions SET committed_sequence = ? WHERE id = ?",
+                (new_committed, sub_id),
+            )
+            conn.execute(
+                "DELETE FROM subscription_deliveries WHERE subscription_id = ?",
+                (sub_id,),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    return get_subscription(sub_id)

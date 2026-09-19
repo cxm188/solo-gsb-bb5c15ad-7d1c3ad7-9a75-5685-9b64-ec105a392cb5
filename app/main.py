@@ -12,7 +12,15 @@ from fastapi.responses import Response, JSONResponse
 
 from . import service
 from .db import init_db
-from .schemas import ClaimIn, CompleteIn, DAGSubmitIn, HeartbeatIn
+from .schemas import (
+    ClaimIn,
+    CompleteIn,
+    DAGSubmitIn,
+    HeartbeatIn,
+    SubscriptionAckIn,
+    SubscriptionIn,
+    SubscriptionPollIn,
+)
 
 
 @asynccontextmanager
@@ -79,6 +87,70 @@ def list_events(
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str) -> dict:
     return service.get_task(task_id)
+
+
+# ---------------------------------------------------------------- 事件订阅
+
+@app.post(
+    "/subscriptions",
+    status_code=201,
+    summary="创建可靠事件订阅",
+    responses={
+        201: {"description": "订阅已创建并持久化 committed_sequence（默认保存事件流当前顶，只收新事件）"},
+    },
+)
+def create_subscription(body: SubscriptionIn) -> dict:
+    return service.create_subscription(body.model_dump())
+
+
+@app.get("/subscriptions", summary="订阅列表（可按 dag_id 过滤）")
+def list_subscriptions(dag_id: str | None = None) -> dict:
+    return service.list_subscriptions(dag_id)
+
+
+@app.get(
+    "/subscriptions/{subscription_id}",
+    summary="订阅详情（含在途批次及其事件）",
+    responses={
+        404: {"description": "订阅不存在（subscription_not_found）"},
+    },
+)
+def get_subscription(subscription_id: str) -> dict:
+    return service.get_subscription(subscription_id)
+
+
+@app.post(
+    "/subscriptions/{subscription_id}/poll",
+    summary="拉取下一批事件（租约投递）",
+    responses={
+        200: {"description": "新批次（含随机 delivery_token 与租约）、租约未过期的重复 poll 原样回放，或无新事件的空批"},
+        404: {"description": "订阅不存在（subscription_not_found）"},
+        422: {"description": "limit 不在 1~100 或 lease_seconds 非正"},
+    },
+)
+def poll_subscription(subscription_id: str, body: SubscriptionPollIn):
+    result = service.poll_subscription(subscription_id, body.model_dump())
+    if isinstance(result, service.ReplayedResponse):
+        # 租约未过期的重复 poll：逐字节回放首次投递的响应体
+        return Response(
+            content=result.body,
+            status_code=result.status_code,
+            media_type="application/json",
+        )
+    return result
+
+
+@app.post(
+    "/subscriptions/{subscription_id}/ack",
+    summary="确认当前在途批次，推进游标",
+    responses={
+        200: {"description": "游标已推进到该批最后一条事件的 sequence，在途批次清除"},
+        404: {"description": "订阅不存在（subscription_not_found）"},
+        409: {"description": "无在途批次（no_pending_delivery）；令牌错误或已过期作废（invalid_delivery_token）"},
+    },
+)
+def ack_subscription(subscription_id: str, body: SubscriptionAckIn) -> dict:
+    return service.ack_subscription(subscription_id, body.model_dump())
 
 
 @app.post("/tasks/{task_id}/heartbeat")

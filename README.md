@@ -85,6 +85,25 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   （`dag.created` 的可空字段均为 `null`）。事件流持久化在 SQLite 中并由数据库触发器
   禁止 `UPDATE`/`DELETE`，可通过 `GET /events` 按 `sequence` 升序键集分页拉取，
   跨页与重启均不漏项、不重复。
+- **可靠事件订阅（至少一次投递）**：`POST /subscriptions` 创建持久化订阅并保存
+  `committed_sequence` 游标——缺省取创建时刻的事件流当前顶（只收之后的新事件，
+  历史事件不补投），也可显式传入 `committed_sequence`（`>= 0`）回放更早的事件；
+  可选 `dag_id` 只订阅单个 DAG 的事件（游标口径仍是全局 `sequence`）。
+  `POST /subscriptions/{id}/poll` 接受 `limit`（1～100，缺省 50）与必须为正数的
+  `lease_seconds`，按 `sequence` 升序返回游标之后的下一批事件（事件对象口径与
+  `GET /events` 完全一致）以及一个随机 `delivery_token` 和租约过期时刻。
+  **同一订阅同时只允许一个未确认批次**：租约未过期时重复 poll 忽略当次
+  `limit`/`lease_seconds`，**逐字节原样回放**该批次（同令牌、同事件、同租约时刻）；
+  租约过期后下一次 poll 作废旧令牌、生成新随机令牌与新租约，并从同一游标处重新
+  投递（游标从未推进，因此未确认事件必然重投，不漏不越）。`POST /subscriptions/{id}/ack`
+  只接受**当前**在途批次的 `delivery_token`，在同一事务内把游标推进到该批最后一条
+  事件的 `sequence` 并清除在途批次；旧令牌（过期重投后已作废）、错误令牌返回
+  `409 invalid_delivery_token`，没有在途批次时返回 `409 no_pending_delivery`，
+  两者都不会移动游标——任何确认都不可能越过未确认事件。无新事件时 poll 返回空批
+  （`delivery_token`/租约为 `null`），不产生在途记录、不推进游标。订阅、在途批次
+  与游标全部持久化在 SQLite 中，重启后租约、原样回放与确认语义不变。订阅支持
+  `GET /subscriptions`（可按 `dag_id` 过滤）与 `GET /subscriptions/{id}`
+  （详情含在途批次及其事件、租约是否已过期）。订阅机制本身不向事件流写入任何事件。
 - **状态接口**：DAG 概览给出各状态计数；任务详情列出每次尝试的状态、租约令牌、
   过期时间、心跳时间、错误信息，以及当前租约是否已过期和阻塞原因。
 - **只读分析**：`GET /dags/{dag_id}/analysis` 按任务声明的 `duration_seconds`
@@ -473,7 +492,101 @@ curl -s 'http://localhost:8000/events?after=0&limit=50'
 curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
 ```
 
-### 9. 只读分析（关键路径）
+### 9. 可靠事件订阅（at-least-once 投递）
+
+`GET /events` 适合临时翻看；需要可靠追赶（网络重试、消费者重启、租约超时重投）时
+使用订阅。创建订阅会保存游标 `committed_sequence`：缺省为创建时刻的事件流当前顶，
+即**只收新事件**；加 `dag_id` 可只订阅一个 DAG；显式给 `committed_sequence` 可回放
+更早的事件：
+
+```bash
+# 只收创建之后的新事件
+curl -s -X POST http://localhost:8000/subscriptions -H 'Content-Type: application/json' -d '{}'
+
+# 只订阅某个 DAG
+curl -s -X POST http://localhost:8000/subscriptions -H 'Content-Type: application/json' \
+  -d '{"dag_id": "<DAG_ID>"}'
+
+# 从 sequence=0 开始（补投全部历史事件）
+curl -s -X POST http://localhost:8000/subscriptions -H 'Content-Type: application/json' \
+  -d '{"committed_sequence": 0}'
+```
+
+```json
+{
+  "id": "01664c35…",
+  "dag_id": null,
+  "committed_sequence": 7,
+  "created_at": "2026-09-19T08:00:00Z",
+  "pending_delivery": null
+}
+```
+
+poll 取下一批（`limit` 1～100，缺省 50；`lease_seconds` 必须为正数），返回按
+`sequence` 升序的事件与随机投递令牌：
+
+```bash
+curl -s -X POST http://localhost:8000/subscriptions/<SUB_ID>/poll \
+  -H 'Content-Type: application/json' \
+  -d '{"limit": 50, "lease_seconds": 30}'
+```
+
+```json
+{
+  "subscription_id": "01664c35…",
+  "events": [
+    {"sequence": 8, "type": "task.claimed", "dag_id": "…", "task_id": "…",
+     "attempt": 1, "from_state": "pending", "to_state": "running",
+     "next_eligible_at": null, "occurred_at": "2026-09-19T08:00:01Z"}
+  ],
+  "count": 1,
+  "delivery_token": "9b22…",
+  "lease_seconds": 30.0,
+  "delivered_at": "2026-09-19T08:00:02Z",
+  "lease_expires_at": "2026-09-19T08:00:32Z",
+  "committed_sequence": 7
+}
+```
+
+处理成功后凭**当前**令牌 ack，游标推进到本批最后一条事件的 `sequence`，然后才能
+poll 下一批：
+
+```bash
+curl -s -X POST http://localhost:8000/subscriptions/<SUB_ID>/ack \
+  -H 'Content-Type: application/json' -d '{"delivery_token": "9b22…"}'
+# -> {..., "committed_sequence": 8, "pending_delivery": null}
+```
+
+投递语义：
+
+- **单批次在途**：同一订阅同时最多一个未确认批次。租约未过期时重复 poll
+  （即使换了 `limit`/`lease_seconds`）逐字节返回同一批、同一令牌、同一租约时刻。
+- **租约过期重投**：超过 `lease_expires_at` 后再次 poll，旧令牌作废，服务端生成
+  **新随机令牌**与新租约，从同一游标重新投递未确认的事件（至少一次，消费端需自行去重）。
+- **确认校验**：ack 只接受当前令牌；旧/错误令牌返回
+  `409 {"error":{"code":"invalid_delivery_token"}}`，没有在途批次时返回
+  `409 {"error":{"code":"no_pending_delivery"}}`；两种情况下游标都不动，
+  任何 ack 都不可能越过未确认事件。
+- **空批**：游标之后暂无（该订阅可见的）新事件时 poll 返回
+  `{"events": [], "count": 0, "delivery_token": null, ...}`，不占用在途名额、
+  不推进游标，之后直接再 poll 即可。
+- **dag_id 过滤**：过滤订阅只返回该 DAG 的事件，但游标仍是全局 `sequence`，
+  ack 推进到本批最后一条的全局序号；其他 DAG 的事件对该订阅不可见。
+- **持久化**：订阅、在途批次（含首批响应体、令牌与租约到期时刻）与游标都在
+  `task-data` 卷的 SQLite 中；服务重启后未过期批次仍逐字节回放，已过期批次可凭
+  新令牌重新投递，游标不回退、不跳号。订阅机制本身不产生事件。
+
+列表与详情：
+
+```bash
+# 全部订阅（可加 ?dag_id= 过滤）；列表的 pending_delivery 为摘要（不含事件内容）
+curl -s http://localhost:8000/subscriptions
+
+# 详情：含完整在途批次（events、租约是否已过期 expired）
+curl -s http://localhost:8000/subscriptions/<SUB_ID> | jq
+```
+
+### 10. 只读分析（关键路径）
 
 按任务声明的 `duration_seconds`（缺省 1）对整个 DAG 做关键路径分析，
 与任务当前运行状态无关，纯粹回答「如果现在开始，理想排程长什么样」：
@@ -535,6 +648,11 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（跳过已满的跨 DAG 并发组，尽量填满 limit） |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
+| `POST` | `/subscriptions` | 创建可靠事件订阅，保存 committed_sequence（默认当前顶），可选 dag_id 过滤 |
+| `GET` | `/subscriptions?dag_id=` | 订阅列表（可按 dag_id 过滤），含在途批次摘要 |
+| `GET` | `/subscriptions/{subscription_id}` | 订阅详情：游标与在途批次（含事件、租约过期状态） |
+| `POST` | `/subscriptions/{subscription_id}/poll` | 投递下一批事件（limit 1~100、正数 lease_seconds），返回随机 delivery_token；租约内重复 poll 原样回放，过期后换新令牌重投 |
+| `POST` | `/subscriptions/{subscription_id}/ack` | 凭当前 delivery_token 确认批次并推进游标；旧/错误令牌 409 |
 | `GET` | `/tasks/{task_id}` | 任务详情：尝试历史、租约、阻塞原因 |
 | `POST` | `/tasks/{task_id}/heartbeat` | 凭当前租约令牌续租 |
 | `POST` | `/tasks/{task_id}/complete` | 凭租约令牌 + `completion_id` 幂等回报成功/失败 |
@@ -587,4 +705,13 @@ attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试�
 令牌心跳/回报 409、递归连锁取消未结束后继且终态后继不变、每个变化仅一条
 `task.canceled` 事件、重复取消与终态取消 409 不产生事件、状态计数与列表过滤
 支持 canceled、退避/阻塞原因与租约字段清除、并发组名额释放、旧库迁移后可用、
-OpenAPI 文档包含取消接口）。
+OpenAPI 文档包含取消接口）、
+可靠事件订阅（创建默认保存事件流当前顶/空流为 0/显式游标回放/`committed_sequence`
+校验、可选 dag_id 过滤且游标仍为全局 sequence、poll 按序返回批次与随机令牌、
+limit 1~100 与正数 lease_seconds 参数校验、租约内重复 poll 逐字节原样回放、
+错误/旧令牌与无在途批次 ack 返回 409 且游标不动、ack 推进到批次最后 sequence、
+逐批 limit=1 拉完整流无漏项/重复、租约过期作废旧令牌并以新令牌从同游标重投、
+过期重投按新 limit 取窗口且不跳过事件、并发 poll 只产生一个在途批次、
+列表与详情视图及 expired 状态、订阅/在途批次/游标重启后持久化、跨重启过期重投、
+过滤订阅重启持久化、订阅不改变 `/events` 且自身不产生事件、未知订阅 404、
+OpenAPI 文档包含订阅接口、旧 SQLite 库迁移后订阅可用）。
